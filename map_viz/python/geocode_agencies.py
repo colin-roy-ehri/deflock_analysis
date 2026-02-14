@@ -15,6 +15,7 @@ Estimated runtime: ~1 hour for 3,500 agencies
 import re
 import time
 import logging
+import json
 from typing import Optional, Tuple, Dict, List
 from dataclasses import dataclass
 from datetime import datetime
@@ -272,6 +273,111 @@ class OrgNameParser:
             'DC', 'AS', 'GU', 'MP', 'PR', 'UM', 'VI'
         }
         return state_code in valid_states
+
+
+class LLMStateClassifier:
+    """Use Claude LLM via Anthropic API to classify state from organization names."""
+
+    API_URL = 'https://api.anthropic.com/v1/messages'
+
+    def __init__(self):
+        """Initialize with API key from environment."""
+        import os
+        self.api_key = os.environ.get('ANTHROPIC_API_KEY')
+        if not self.api_key:
+            logger.warning('ANTHROPIC_API_KEY not set - LLM state classification will be skipped')
+        self.cache = {}  # Simple cache to avoid redundant API calls
+
+    def classify_state(self, org_name: str) -> Optional[str]:
+        """
+        Use Claude to classify the state from an organization name via Anthropic API.
+
+        Args:
+            org_name: Organization name (e.g., "Blount County Commission (AL)")
+
+        Returns:
+            State abbreviation (e.g., "AL") or None if unable to classify
+        """
+        if not self.api_key:
+            return None
+
+        if org_name in self.cache:
+            return self.cache[org_name]
+
+        # Check for federal agencies - default to DC
+        if any(keyword in org_name.lower() for keyword in ['federal', 'national', 'us ', 'usa', 'united states', 'postal', 'fbi', 'atf', 'ncmec']):
+            logger.debug(f'Classified as federal agency: {org_name} → DC')
+            self.cache[org_name] = 'DC'
+            return 'DC'
+
+        try:
+            response = requests.post(
+                self.API_URL,
+                headers={
+                    'x-api-key': self.api_key,
+                    'anthropic-version': '2023-06-01',
+                    'content-type': 'application/json'
+                },
+                json={
+                    'model': 'claude-opus-4-6',
+                    'max_tokens': 50,
+                    'system': '''You are a US state classifier. Given a police or law enforcement agency name,
+extract the US state abbreviation (2 letters like AL, TX, CA, etc).
+
+If the name clearly references a specific state/city, return that state abbreviation.
+If it's a federal agency or national organization, return "DC".
+If you cannot determine the state with reasonable confidence, return "UNKNOWN".
+
+Respond with ONLY the state abbreviation, nothing else.''',
+                    'messages': [
+                        {
+                            'role': 'user',
+                            'content': f'Organization name: {org_name}'
+                        }
+                    ]
+                },
+                timeout=10
+            )
+
+            if response.status_code != 200:
+                logger.debug(f'API error classifying {org_name}: {response.status_code}')
+                self.cache[org_name] = None
+                return None
+
+            data = response.json()
+            response_text = data['content'][0]['text'].strip().upper()
+
+            # Validate the response is a valid state code
+            valid_states = {
+                'AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA',
+                'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD',
+                'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ',
+                'NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC',
+                'SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY', 'DC', 'UNKNOWN'
+            }
+
+            if response_text in valid_states:
+                if response_text == 'UNKNOWN':
+                    logger.debug(f'LLM could not determine state for {org_name}')
+                    self.cache[org_name] = None
+                    return None
+                else:
+                    logger.debug(f'LLM classified: {org_name} → {response_text}')
+                    self.cache[org_name] = response_text
+                    return response_text
+            else:
+                logger.debug(f'LLM returned invalid state for {org_name}: {response_text}')
+                self.cache[org_name] = None
+                return None
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f'Error classifying state for {org_name}: {e}')
+            self.cache[org_name] = None
+            return None
+        except (KeyError, IndexError, json.JSONDecodeError) as e:
+            logger.error(f'Parse error classifying state for {org_name}: {e}')
+            self.cache[org_name] = None
+            return None
 
 
 class NominatimGeocoder:
@@ -648,6 +754,7 @@ def main():
     # Initialize components
     parser = OrgNameParser()
     geocoder = NominatimGeocoder()
+    llm_classifier = LLMStateClassifier()
     bq = BigQueryManager()
 
     # Configure source tables
@@ -675,23 +782,35 @@ def main():
         # Parse agency name
         parsed = parser.parse(org_name)
         if not parsed:
-            logger.warning(f'  ✗ Failed to parse org_name')
-            skip_count += 1
-            bq.insert_agency_location(
-                org_name=org_name,
-                city=None,
-                state=None,
-                latitude=None,
-                longitude=None,
-                geocode_confidence=None,
-                geocode_source='nominatim',
-                display_name=None,
-                notes='Parse failed'
-            )
-            continue
+            # Try LLM classifier as fallback
+            logger.debug(f'  → Attempting LLM state classification...')
+            llm_state = llm_classifier.classify_state(org_name)
+            if llm_state:
+                # Use LLM-classified state with generic city placeholder
+                parsed_city = f'{llm_state} Agency'
+                parsed_state = llm_state
+                logger.info(f'  ✓ LLM classified state: {parsed_state}')
+            else:
+                logger.warning(f'  ✗ Failed to parse org_name (LLM also failed)')
+                skip_count += 1
+                bq.insert_agency_location(
+                    org_name=org_name,
+                    city=None,
+                    state=None,
+                    latitude=None,
+                    longitude=None,
+                    geocode_confidence=None,
+                    geocode_source='nominatim',
+                    display_name=None,
+                    notes='Parse and LLM classification failed'
+                )
+                continue
+        else:
+            parsed_city = parsed.city
+            parsed_state = parsed.state
 
         # Geocode location
-        geocoded = geocoder.geocode(parsed.city, parsed.state)
+        geocoded = geocoder.geocode(parsed_city, parsed_state)
 
         if geocoded:
             # Extract geocode_method (with backwards compatibility)
@@ -720,8 +839,8 @@ def main():
 
             bq.insert_agency_location(
                 org_name=org_name,
-                city=parsed.city,
-                state=parsed.state,
+                city=parsed_city,
+                state=parsed_state,
                 latitude=geocoded['latitude'],
                 longitude=geocoded['longitude'],
                 geocode_confidence=geocoded['geocode_confidence'],
@@ -732,12 +851,12 @@ def main():
             )
         else:
             # This branch should now be very rare (only if state code is invalid)
-            logger.warning(f'  ✗ All geocoding tiers failed for {parsed.city}, {parsed.state}')
+            logger.warning(f'  ✗ All geocoding tiers failed for {parsed_city}, {parsed_state}')
             fail_count += 1
             bq.insert_agency_location(
                 org_name=org_name,
-                city=parsed.city,
-                state=parsed.state,
+                city=parsed_city,
+                state=parsed_state,
                 latitude=None,
                 longitude=None,
                 geocode_confidence=None,
